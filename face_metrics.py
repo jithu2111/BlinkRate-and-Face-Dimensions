@@ -35,15 +35,34 @@ FACE_LANDMARKER_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
     "face_landmarker/float16/1/face_landmarker.task"
 )
-MODEL_PATH = Path(__file__).parent / "face_landmarker.task"
+POSE_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+)
+FACE_MODEL_PATH = Path(__file__).parent / "face_landmarker.task"
+POSE_MODEL_PATH = Path(__file__).parent / "pose_landmarker.task"
 
 
-def ensure_model() -> Path:
-    """Download the Face Landmarker model (~3.8 MB) once, cache next to script."""
-    if not MODEL_PATH.exists():
-        print(f"Downloading face landmarker model to {MODEL_PATH} ...")
-        urllib.request.urlretrieve(FACE_LANDMARKER_MODEL_URL, MODEL_PATH)
-    return MODEL_PATH
+def _download(url: str, dest: Path) -> Path:
+    if not dest.exists():
+        print(f"Downloading {dest.name} ...")
+        urllib.request.urlretrieve(url, dest)
+    return dest
+
+
+def ensure_face_model() -> Path:
+    return _download(FACE_LANDMARKER_MODEL_URL, FACE_MODEL_PATH)
+
+
+def ensure_pose_model() -> Path:
+    return _download(POSE_LANDMARKER_MODEL_URL, POSE_MODEL_PATH)
+
+
+# Anthropometric ratio from Farkas (1994) craniofacial norms:
+# vertex-to-menton (true head height) ≈ 1.30 × trichion-to-menton (forehead-to-chin).
+# Used to derive head_height_cm from the measured forehead-to-chin distance, since
+# MediaPipe Face Mesh has no landmark at the crown/vertex.
+HEAD_HEIGHT_RATIO = 1.30
 
 
 # MediaPipe Face Mesh landmark indices.
@@ -61,11 +80,15 @@ RIGHT_EYE_VERT = (386, 374)
 LEFT_IRIS = [468, 469, 470, 471, 472]   # 468 is center
 RIGHT_IRIS = [473, 474, 475, 476, 477]
 
-# Face dimensions.
-FACE_TOP = 10           # forehead / hairline apex
-FACE_BOTTOM = 152       # chin
-FACE_LEFT = 234         # left cheek (subject's right)
+# Face dimensions (Face Mesh).
+FACE_TOP = 10           # mid-forehead / glabella (NOT hairline)
+FACE_BOTTOM = 152       # chin (menton)
+FACE_LEFT = 234         # left cheek, zygomatic arch (bizygomatic width point)
 FACE_RIGHT = 454        # right cheek
+
+# Pose landmark indices for ear-to-ear (bitragion) width.
+POSE_LEFT_EAR = 7
+POSE_RIGHT_EAR = 8
 
 # Nose.
 NOSE_TOP = 168          # bridge between eyes
@@ -110,8 +133,10 @@ class VideoResult:
     blinks: int
     blink_rate_per_sec: float
     # All in cm.
-    face_height: float
-    face_width: float
+    face_height: float          # forehead (landmark 10) to chin — measured
+    face_width: float           # cheek-to-cheek (bizygomatic) — measured
+    head_height: float          # derived: face_height * 1.30 (vertex-to-menton)
+    ear_to_ear: float           # measured via MediaPipe Pose (bitragion)
     left_eye_width: float
     left_eye_height: float
     right_eye_width: float
@@ -159,9 +184,9 @@ def process_video(path: Path, sample_fps: float) -> VideoResult:
 
     frame_stride = max(1, int(round(src_fps / sample_fps)))
 
-    model_path = ensure_model()
-    options = mp_vision.FaceLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
+    face_model_path = ensure_face_model()
+    face_options = mp_vision.FaceLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(face_model_path)),
         running_mode=mp_vision.RunningMode.VIDEO,
         num_faces=1,
         min_face_detection_confidence=0.5,
@@ -170,7 +195,18 @@ def process_video(path: Path, sample_fps: float) -> VideoResult:
         output_face_blendshapes=False,
         output_facial_transformation_matrixes=False,
     )
-    face_mesh = mp_vision.FaceLandmarker.create_from_options(options)
+    face_mesh = mp_vision.FaceLandmarker.create_from_options(face_options)
+
+    pose_model_path = ensure_pose_model()
+    pose_options = mp_vision.PoseLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(pose_model_path)),
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    pose = mp_vision.PoseLandmarker.create_from_options(pose_options)
 
     blink_count = 0
     closed_streak = 0
@@ -186,6 +222,7 @@ def process_video(path: Path, sample_fps: float) -> VideoResult:
     nose_w = DimensionAccumulator()
     mouth_w = DimensionAccumulator()
     mouth_h = DimensionAccumulator()
+    ear_px = DimensionAccumulator()
 
     processed = 0
     frame_idx = 0
@@ -247,8 +284,16 @@ def process_video(path: Path, sample_fps: float) -> VideoResult:
         mouth_w.add(_dist(_pt(lms, MOUTH_LEFT, w, h), _pt(lms, MOUTH_RIGHT, w, h)))
         mouth_h.add(_dist(_pt(lms, MOUTH_TOP, w, h), _pt(lms, MOUTH_BOTTOM, w, h)))
 
+        # --- Ear-to-ear via Pose (separate model, same frame) ---
+        pose_result = pose.detect_for_video(mp_image, timestamp_ms)
+        if pose_result.pose_landmarks:
+            plms = pose_result.pose_landmarks[0]
+            ear_px.add(_dist(_pt(plms, POSE_LEFT_EAR, w, h),
+                             _pt(plms, POSE_RIGHT_EAR, w, h)))
+
     cap.release()
     face_mesh.close()
+    pose.close()
 
     # Handle a trailing blink that never reopened before video end.
     if closed_streak >= EAR_CONSECUTIVE_FRAMES:
@@ -265,6 +310,7 @@ def process_video(path: Path, sample_fps: float) -> VideoResult:
         return acc.median() * scale if scale == scale else 0.0
 
     blink_rate = blink_count / duration if duration > 0 else 0.0
+    face_height_cm = to_cm(face_h_px)
 
     return VideoResult(
         video=str(path),
@@ -272,8 +318,10 @@ def process_video(path: Path, sample_fps: float) -> VideoResult:
         processed_frames=processed,
         blinks=blink_count,
         blink_rate_per_sec=blink_rate,
-        face_height=to_cm(face_h_px),
+        face_height=face_height_cm,
         face_width=to_cm(face_w_px),
+        head_height=face_height_cm * HEAD_HEIGHT_RATIO,
+        ear_to_ear=to_cm(ear_px),
         left_eye_width=to_cm(l_eye_w),
         left_eye_height=to_cm(l_eye_h),
         right_eye_width=to_cm(r_eye_w),
@@ -301,7 +349,9 @@ def print_report(r: VideoResult) -> None:
           f"({r.blink_rate_per_sec * 60:.1f} blinks/min)")
     print(f"Calibration: iris = {r.iris_px:.1f} px -> {IRIS_DIAMETER_CM} cm")
     print("Dimensions (cm):")
-    print(f"  Face     H (head-to-chin): {r.face_height:.2f}   W (ear-to-ear): {r.face_width:.2f}")
+    print(f"  Face     forehead-to-chin: {r.face_height:.2f}   cheek-to-cheek: {r.face_width:.2f}")
+    print(f"  Head     head-to-chin (derived, x{HEAD_HEIGHT_RATIO}): {r.head_height:.2f}")
+    print(f"  Head     ear-to-ear (Pose): {r.ear_to_ear:.2f}")
     print(f"  L eye    W: {r.left_eye_width:.2f}   H: {r.left_eye_height:.2f}")
     print(f"  R eye    W: {r.right_eye_width:.2f}   H: {r.right_eye_height:.2f}")
     print(f"  Nose     L: {r.nose_length:.2f}   W: {r.nose_width:.2f}")
@@ -311,7 +361,8 @@ def print_report(r: VideoResult) -> None:
 def write_csv(results: Iterable[VideoResult], out_path: Path) -> None:
     fields = [
         "video", "duration_sec", "processed_frames", "blinks", "blink_rate_per_sec",
-        "face_height_cm", "face_width_cm",
+        "forehead_to_chin_cm", "cheek_to_cheek_cm",
+        "head_height_cm_derived", "ear_to_ear_cm_pose",
         "left_eye_width_cm", "left_eye_height_cm",
         "right_eye_width_cm", "right_eye_height_cm",
         "nose_length_cm", "nose_width_cm",
@@ -326,6 +377,7 @@ def write_csv(results: Iterable[VideoResult], out_path: Path) -> None:
                 r.video, f"{r.duration_sec:.2f}", r.processed_frames,
                 r.blinks, f"{r.blink_rate_per_sec:.6f}",
                 f"{r.face_height:.3f}", f"{r.face_width:.3f}",
+                f"{r.head_height:.3f}", f"{r.ear_to_ear:.3f}",
                 f"{r.left_eye_width:.3f}", f"{r.left_eye_height:.3f}",
                 f"{r.right_eye_width:.3f}", f"{r.right_eye_height:.3f}",
                 f"{r.nose_length:.3f}", f"{r.nose_width:.3f}",
@@ -358,6 +410,8 @@ def aggregate(results: list[VideoResult]) -> VideoResult:
         blink_rate_per_sec=rate,
         face_height=med("face_height"),
         face_width=med("face_width"),
+        head_height=med("head_height"),
+        ear_to_ear=med("ear_to_ear"),
         left_eye_width=med("left_eye_width"),
         left_eye_height=med("left_eye_height"),
         right_eye_width=med("right_eye_width"),
